@@ -11,16 +11,39 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # কনফিগারেশন
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 SITE_URL = os.getenv("SITE_URL", "https://movielol.net")
-CHANNEL_OR_CHAT_ID = os.getenv("CHANNEL_ID", "YOUR_CHANNEL_ID_HERE")
+CHANNEL_OR_CHAT_ID = os.getenv("CHANNEL_ID", "")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ট্র্যাকিংয়ের জন্য শেষ দেখা মুভির লিংক
-last_seen_movie_link = None
+# ডেটাবেস/ফাইল হ্যান্ডলিং
+USERS_FILE = "subscribers.txt"
+SEEN_MOVIES_FILE = "seen_movies.txt"
+
+def load_subscribers():
+    if not os.path.exists(USERS_FILE):
+        return set()
+    with open(USERS_FILE, "r") as f:
+        return set(line.strip() for line in f if line.strip())
+
+def save_subscriber(chat_id):
+    subscribers = load_subscribers()
+    if str(chat_id) not in subscribers:
+        with open(USERS_FILE, "a") as f:
+            f.write(f"{chat_id}\n")
+
+def load_seen_movies():
+    if not os.path.exists(SEEN_MOVIES_FILE):
+        return set()
+    with open(SEEN_MOVIES_FILE, "r") as f:
+        return set(line.strip() for line in f if line.strip())
+
+def save_seen_movies(links):
+    with open(SEEN_MOVIES_FILE, "a") as f:
+        for link in links:
+            f.write(f"{link}\n")
 
 def clean_movie_title(text):
-    """টাইটেল ও সার্চ কোয়েরি থেকে অপ্রয়োজনীয় শব্দ মুছে মূল নাম বের করার ফাংশন"""
     noise_words = [
         r'\bfull movie\b', r'\bwatch online\b', r'\bdownload\b', 
         r'\bhd\b', r'\bweb-dl\b', r'\bbluray\b', r'\borg\b', 
@@ -34,7 +57,6 @@ def clean_movie_title(text):
     return ' '.join(cleaned.split()).strip().lower()
 
 def get_latest_movies_from_site():
-    """সাইট থেকে সাম্প্রতিক মুভিগুলো সংগ্রহ করবে"""
     movies = []
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -57,11 +79,10 @@ def get_latest_movies_from_site():
                                 'image': img_url
                             })
     except Exception as e:
-        print(f"Error fetching latest movies: {e}")
+        print(f"Error fetching movies: {e}")
     return movies
 
 def search_movie_on_site(query):
-    """ইউজারের সার্চ ফিল্টার করে শুধুমাত্র সঠিক মুভিটি রিটার্ন করবে"""
     results = []
     try:
         search_query = clean_movie_title(query)
@@ -88,22 +109,22 @@ def search_movie_on_site(query):
                         cleaned_title = clean_movie_title(raw_title)
                         cleaned_url = clean_movie_title(href)
 
-                        # সার্চ শব্দের মিল নিশ্চিত করা
-                        is_match = any(word in cleaned_title or word in cleaned_url for word in query_words)
-                        
-                        if is_match and not any(r['link'] == full_link for r in results):
-                            results.append({
-                                'title': raw_title.strip(),
-                                'link': full_link,
-                                'image': img_url
-                            })
+                        # শুধুমাত্র সার্চের নামের সাথে মিল থাকলে যুক্ত হবে
+                        if any(w in cleaned_title or w in cleaned_url for w in query_words):
+                            if not any(r['link'] == full_link for r in results):
+                                results.append({
+                                    'title': raw_title.strip(),
+                                    'link': full_link,
+                                    'image': img_url
+                                })
     except Exception as e:
         print(f"Search error: {e}")
     return results
 
-# ৩ ভাষার স্বাগতম বার্তা (/start)
+# ৩ ভাষার স্বাগতম বার্তা এবং ইউজার আইডি সেভ
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
+    save_subscriber(message.chat.id)
     welcome_text = (
         "👋 *স্বাগতম!*\n"
         "আপনি যে মুভিটি দেখতে চান তার নাম লিখে সার্চ করুন।\n\n"
@@ -117,6 +138,7 @@ def send_welcome(message):
 # সার্চ হ্যান্ডলার
 @bot.message_handler(func=lambda message: True)
 def handle_search(message):
+    save_subscriber(message.chat.id)
     query = message.text.strip()
     if query.startswith('/'):
         return
@@ -126,19 +148,18 @@ def handle_search(message):
     
     if not results:
         not_found_text = (
-            "❌ দুঃখিত, কোনো মুভি পাওয়া যায়নি।\n"
-            "❌ Sorry, no movie found.\n"
-            "❌ क्षमा करें, कोई मूवी नहीं मिली।"
+            "❌ দুঃখিত, এই নামের কোনো মুভি পাওয়া যায়নি।\n"
+            "❌ Sorry, no matching movie found.\n"
+            "❌ क्षमा करें, कोई संबंधित मूवी नहीं मिली।"
         )
         bot.reply_to(message, not_found_text)
         return
 
-    # সর্বোচ্চ ৩টি প্রাসঙ্গিক রেজাল্ট স্টাইলিশভাবে পাঠানো
     for item in results[:3]:
         caption = (
             f"🎬 *{item['title']}*\n\n"
-            f"✨ *Quality:* Full HD / HDRip\n"
-            f"🍿 *Language:* Original / Multi-Audio\n"
+            f"✨ *Quality:* Full HD / WEB-DL\n"
+            f"🍿 *Language:* Original / Dubbed\n"
             f"━━━━━━━━━━━━━━━━━━━"
         )
         markup = InlineKeyboardMarkup()
@@ -148,61 +169,68 @@ def handle_search(message):
             try:
                 bot.send_photo(message.chat.id, item['image'], caption=caption, reply_markup=markup, parse_mode='Markdown')
                 continue
-            except Exception as e:
-                print(f"Photo error: {e}")
-
+            except Exception:
+                pass
         bot.send_message(message.chat.id, caption, reply_markup=markup, parse_mode='Markdown')
 
-# স্বয়ংক্রিয় ব্যাকগ্রাউন্ড চেকার
+# প্রতিটি সাবস্ক্রাইবার ও চ্যানেলে মেসেজ ব্রডকাস্ট
+def broadcast_movie(movie):
+    caption = (
+        f"🔥 *নতুন মুভি আপলোড হয়েছে!*\n\n"
+        f"🎬 *{movie['title']}*\n\n"
+        f"✨ এখনই ওয়েবসাইটে গিয়ে সরাসরি দেখুন বা ডাউনলোড করুন!\n"
+        f"━━━━━━━━━━━━━━━━━━━"
+    )
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📥 ডাউনলোড লিংক", url=movie['link']))
+
+    targets = list(load_subscribers())
+    if CHANNEL_OR_CHAT_ID:
+        targets.append(CHANNEL_OR_CHAT_ID)
+
+    for target in targets:
+        try:
+            if movie.get('image') and movie['image'].startswith('http'):
+                bot.send_photo(target, movie['image'], caption=caption, reply_markup=markup, parse_mode='Markdown')
+            else:
+                bot.send_message(target, caption, reply_markup=markup, parse_mode='Markdown')
+            time.sleep(0.1) # টেলিগ্রাম রেট লিমিট এড়াতে সামান্য বিরতি
+        except Exception as e:
+            print(f"Broadcast failed to {target}: {e}")
+
+# স্বয়ংক্রিয় ব্যাকগ্রাউন্ড ট্র্যাকার
 def auto_check_new_movies():
-    global last_seen_movie_link
-    
-    # প্রাথমিক সেটআপ
-    try:
-        initial = get_latest_movies_from_site()
-        if initial:
-            last_seen_movie_link = initial[0]['link']
-    except Exception as e:
-        print(f"Init tracker error: {e}")
+    # প্রথমবার বটের মেমোরিতে থাকা পুরনো মুভিগুলো রেকর্ড করা (যাতে স্টার্ট দিলে সব না আসে)
+    seen_links = load_seen_movies()
+    if not seen_links:
+        current_site_movies = get_latest_movies_from_site()
+        initial_links = [m['link'] for m in current_site_movies]
+        save_seen_movies(initial_links)
+        seen_links = set(initial_links)
 
     while True:
         try:
-            movies = get_latest_movies_from_site()
-            if movies and last_seen_movie_link:
-                latest = movies[0]
-                if latest['link'] != last_seen_movie_link:
-                    last_seen_movie_link = latest['link']
-                    
-                    caption = (
-                        f"🔥 *নতুন মুভি যুক্ত হয়েছে! (New Movie Alert)*\n\n"
-                        f"🎬 *{latest['title']}*\n\n"
-                        f"✨ নতুন প্রিন্ট সহ ওয়েবসাইটে যুক্ত হয়েছে!\n"
-                        f"━━━━━━━━━━━━━━━━━━━"
-                    )
-                    markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton("📥 এখনই দেখুন ও ডাউনলোড করুন", url=latest['link']))
+            current_movies = get_latest_movies_from_site()
+            new_movies = [m for m in current_movies if m['link'] not in seen_links]
 
-                    if CHANNEL_OR_CHAT_ID and CHANNEL_OR_CHAT_ID != "YOUR_CHANNEL_ID_HERE":
-                        if latest.get('image') and latest['image'].startswith('http'):
-                            try:
-                                bot.send_photo(CHANNEL_OR_CHAT_ID, latest['image'], caption=caption, reply_markup=markup, parse_mode='Markdown')
-                            except Exception:
-                                bot.send_message(CHANNEL_OR_CHAT_ID, caption, reply_markup=markup, parse_mode='Markdown')
-                        else:
-                            bot.send_message(CHANNEL_OR_CHAT_ID, caption, reply_markup=markup, parse_mode='Markdown')
+            # নতুন মুভি পাওয়া গেলে সবচেয়ে পুরনো থেকে শুরু করে নতুন পর্যন্ত পোস্ট করা
+            for movie in reversed(new_movies):
+                broadcast_movie(movie)
+                seen_links.add(movie['link'])
+                save_seen_movies([movie['link']])
+                time.sleep(1)
+
         except Exception as e:
-            print(f"Auto-checker error: {e}")
-            
-        time.sleep(300) # প্রতি ৫ মিনিটে চেক করবে
+            print(f"Auto-checker loop error: {e}")
 
-# Render-এর জন্য রুট
+        time.sleep(120)  # প্রতি ২ মিনিট পরপর সাইট চেক করবে
+
 @app.route('/')
-def index():
-    return "Bot is actively running!", 200
+def home():
+    return "Bot is running perfectly!", 200
 
-# টেলিগ্রাম ওয়েবহুক
 @app.route(f"/{BOT_TOKEN}", methods=['POST'])
-def webhook():
+def telegram_webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
@@ -211,16 +239,14 @@ def webhook():
     return "Forbidden", 403
 
 if __name__ == '__main__':
-    # অটো চেকার থ্রেড ব্যাকগ্রাউন্ডে চালু করা
     thread = threading.Thread(target=auto_check_new_movies, daemon=True)
     thread.start()
-    
-    # Render Webhook সেটআপ
+
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:
         bot.remove_webhook()
         time.sleep(1)
         bot.set_webhook(url=f"{render_url.rstrip('/')}/{BOT_TOKEN}")
-    
+
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
