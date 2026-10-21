@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]
-flask
+Flask
 requests
 beautifulsoup4
+pyTelegramBotAPI
