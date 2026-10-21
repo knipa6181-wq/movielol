@@ -2,125 +2,173 @@ import os
 import json
 import logging
 import urllib.parse
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO)
 
-# কনফিগারেশন
-BOT_TOKEN = "8840283228:AAFy1dZxOfa9tFTksodSAVK38UkwtAlauU8"
+# টোকেন ও কনফিগারেশন
+BOT_TOKEN = "8840283228:AAfy1dZXOfa9tFTksodSAVK38UWktwAlAU8"
 WEBSITE_URL = "https://movielol.net"
 DATA_FILE = "movies_data.json"
 PORT = int(os.environ.get("PORT", 10000))
-
-# Render-এর দেওয়া অ্যাপ URL (Render ড্যাশবোর্ড থেকে পাওয়া URL)
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://movielol.onrender.com")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 flask_app = Flask(__name__)
 
-# ডাটাবেজ হ্যান্ডলিং
+# লোকাল ডাটাবেস লোড ও সেভ
 def load_data():
     if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            try:
                 return json.load(f)
-        except Exception:
-            return []
-    return []
+            except Exception:
+                return {}
+    return {}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
 movies_db = load_data()
 
-# বট কমান্ড হ্যান্ডলার
+# ওয়েবসাইট স্ক্র্যাপ করে মুভির ইমেজ, লিংক ও টাইটেল বের করা
+def scrape_movie_from_site(query):
+    try:
+        search_url = f"{WEBSITE_URL}/?s={urllib.parse.quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = requests.get(search_url, headers=headers, timeout=10)
+        
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            
+            # ওয়েবসাইটের কার্ড/পোস্ট কনটেইনার
+            movie_card = soup.find("article") or soup.find("div", class_="post") or soup.find("div", class_="card")
+            
+            if movie_card:
+                # পোস্ট লিংক
+                link_tag = movie_card.find("a", href=True)
+                post_url = link_tag["href"] if link_tag else None
+                
+                # ইমেজ লিংক
+                img_tag = movie_card.find("img")
+                img_url = None
+                if img_tag:
+                    img_url = img_tag.get("src") or img_tag.get("data-src")
+                
+                # টাইটেল
+                title = movie_card.get_text().strip().split("\n")[0]
+                if not title and link_tag:
+                    title = link_tag.get("title", query)
+                
+                if post_url:
+                    return {
+                        "title": title or query,
+                        "url": post_url,
+                        "image": img_url
+                    }
+    except Exception as e:
+        logging.error(f"Scraping error: {e}")
+    return None
+
+# /start কমান্ড
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🎬 *MovieLoL.net Link Poster Bot* 🍿\n\n"
-        "মুভির নাম এবং লিংক যেকোনো ফরম্যাটে পাঠান:\n\n"
-        "🔹 *পদ্ধতি ১:* `Jawan - https://downloadlink.com/file`\n"
-        "🔹 *পদ্ধতি ২:* `Inception` (সাইটে সরাসরি সার্চ হবে)\n\n"
-        "সব সংরক্ষিত পোস্ট দেখতে `/all` লিখুন।"
+        "🎬 *MovieLol.net Bot এ স্বাগতম!*\n\n"
+        "যে কোনো মুভির নাম লিখে পাঠালে ওয়েবসাইট থেকে সার্চ করে সরাসরি ডাউনলোড লিংক দেওয়া হবে।\n\n"
+        "মুভি লিংক দেখতে নিচের যে কোনো মুভির নাম লিখে মেসেজ দিন।"
     )
-    if update.message:
-        await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def process_movie_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+# টেক্সট মেসেজ ও সার্চ হ্যান্ডলার
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    
+    # অ্যাডমিন যদি ফরম্যাটে পোস্ট করতে চায়: Movie Name - DownloadLink
+    if " - " in text:
+        parts = text.split(" - ", 1)
+        name = parts[0].strip()
+        link = parts[1].strip()
+        movies_db[name.lower()] = {"title": name, "url": link, "image": None}
+        save_data(movies_db)
+        await update.message.reply_text(f"✅ '{name}' সফলভাবে সেভ করা হয়েছে!")
         return
 
-    raw_text = update.message.text.strip()
+    # সাধারণ সার্চ
+    await update.message.reply_text("🔍 ওয়েবসাইট থেকে খোঁজা হচ্ছে, একটু অপেক্ষা করুন...")
     
-    if "http://" in raw_text or "https://" in raw_text:
-        parts = raw_text.split("http", 1)
-        movie_name = parts[0].replace("-", "").strip()
-        download_url = "http" + parts[1].strip()
-        if not movie_name:
-            movie_name = "Watch Movie"
+    movie_info = None
+    query_key = text.lower()
+    
+    # প্রথমে লোকাল ডাটাতে চেক
+    if query_key in movies_db:
+        movie_info = movies_db[query_key]
     else:
-        movie_name = raw_text
-        encoded_query = urllib.parse.quote_plus(movie_name)
-        download_url = f"{WEBSITE_URL}/?s={encoded_query}"
+        # সরাসরি ওয়েবসাইটে স্ক্র্যাপ করে সার্চ
+        movie_info = scrape_movie_from_site(text)
+        if not movie_info:
+            # ফলব্যাক লিংক তৈরি
+            fallback_url = f"{WEBSITE_URL}/?s={urllib.parse.quote(text)}"
+            movie_info = {
+                "title": text,
+                "url": fallback_url,
+                "image": None
+            }
 
-    entry = {"title": movie_name, "link": download_url}
-    movies_db.append(entry)
-    save_data(movies_db)
-
+    # বাটন তৈরি
     buttons = [
-        [InlineKeyboardButton("▶️ Watch / Download", url=download_url)],
-        [InlineKeyboardButton("🌐 Visit MovieLoL.net", url=WEBSITE_URL)]
+        [InlineKeyboardButton("📥 Watch / Download", url=movie_info["url"])],
+        [InlineKeyboardButton("🌐 Visit MovieLol.net", url=WEBSITE_URL)]
     ]
     reply_markup = InlineKeyboardMarkup(buttons)
-
-    post_text = (
-        f"🎬 *{movie_name}*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 *Direct Link:* {download_url}\n"
-        f"🌐 *Main Site:* [{WEBSITE_URL}]({WEBSITE_URL})\n\n"
-        "⚡ _Enjoy high quality streaming & downloads on MovieLoL!_"
-    )
-
-    await update.message.reply_text(
-        post_text, 
-        parse_mode="Markdown", 
-        reply_markup=reply_markup,
-        disable_web_page_preview=False
-    )
-
-async def show_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    if not movies_db:
-        await update.message.reply_text("এখনও কোনো মুভি লিংক যুক্ত করা হয়নি।")
-        return
-
-    text = "📁 *MovieLoL.net সংরক্ষিত মুভি তালিকা (সর্বশেষ ২০টি):*\n\n"
-    for idx, item in enumerate(movies_db[-20:], 1):
-        text += f"{idx}. [{item['title']}]({item['link']})\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
-
-# হেলথ চেক রুট (Render পোর্ট ওপেন রাখার জন্য)
-@flask_app.route('/')
-def home():
-    return "MovieLoL Bot is Running Live!"
-
-if __name__ == '__main__':
-    # Telegram Application সেটআপ
-    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("all", show_all))
-    bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), process_movie_post))
-
-    # Render-এর জন্য Webhook চালু করা
-    webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
     
-    bot_app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=webhook_url
+    caption = (
+        f"🎬 *{movie_info['title']}*\n\n"
+        f"🔗 *Direct Link:* {movie_info['url']}\n"
+        f"🌐 *Main Site:* {WEBSITE_URL}\n\n"
+        f"✨ Enjoy high quality streaming & downloads on MovieLol!"
     )
+
+    # ছবি থাকলে ছবিসহ পাঠাবে, না থাকলে শুধু টেক্সট
+    if movie_info.get("image"):
+        try:
+            await update.message.reply_photo(
+                photo=movie_info["image"],
+                caption=caption,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+            return
+        except Exception as e:
+            logging.error(f"Photo send error: {e}")
+            
+    await update.message.reply_text(
+        caption,
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+# Telegram Application তৈরি
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+@flask_app.route(f"/{BOT_TOKEN}", methods=["POST"])
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
+    return Response(status=200)
+
+@flask_app.route("/")
+def index():
+    return "Bot is running!"
+
+if __name__ == "__main__":
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
+        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}")
+    
+    flask_app.run(host="0.0.0.0", port=PORT)
